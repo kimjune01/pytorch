@@ -1,3 +1,14 @@
+The original PyTorch code is licensed under the BSD-3-Clause license,
+reproduced below.
+
+All modifications and additions by June Kim (Copyright (c) 2026 June Kim)
+are licensed under the GNU Affero General Public License v3.0 or later.
+You may obtain a copy of the AGPL at <https://www.gnu.org/licenses/agpl-3.0.html>.
+
+-------------------------------------------------------
+Original PyTorch License (BSD-3-Clause)
+-------------------------------------------------------
+
 From PyTorch:
 
 Copyright (c) 2016-     Facebook, Inc            (Adam Paszke)
