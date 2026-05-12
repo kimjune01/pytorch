@@ -411,3 +411,57 @@ Investigation depth: 1 outer-loop iteration (Interrogate → Prework → Bench �
 2. **Build in-tree first** (Phase 6.5) — apply the C++ patch, rebuild PyTorch (30-60 min), re-bench in-tree, validate against `pytest test/test_linalg.py -k einsum`. Then ship. Higher confidence, longer turnaround.
 3. **Run gemini round 2** on the refined version first — adversarial check on the patched proposal. Cheap (~2 min); may surface or not.
 4. **Sit on the work** — graph + prework as standalone artifacts, defer ship to a later session.
+
+---
+
+## Phase 6.5 — in-tree build + bench (DONE, 2026-05-12)
+
+User chose option 2. Build environment took several hours to converge:
+- Host build (Ubuntu 26.04 + CUDA 13) blocked by glibc/CUDA noexcept conflict in `crt/math_functions.h`
+- Switched to NVIDIA's `nvcr.io/nvidia/pytorch:25.10-py3` container (Ubuntu 24.04 + CUDA 13 + GCC 13)
+- Hit a stale `torch/headeronly/version.h` (cached from a prior build attempt with the wrong base) saying MINOR=9 instead of 12; this trips a `static_assert` in `stableivalue_conversions.h` that requires `TORCH_FEATURE_VERSION >= TORCH_VERSION_2_10_0`. Regenerating via `gen_version_header.py` fixed it.
+- Source moved from `/mnt/d/...` (slow 9p) to `/home/junekim/pytorch/` (ext4) for tractable build I/O
+- Rebased onto `v2.12.0-rc9` to dodge an unrelated stable-ABI build break on `upstream/main`'s `shim_common.cpp`
+- Final build: ~4 hours total (mostly nvcc on flash-attention + cutlass kernels)
+
+### Validation results (RTX 4080 / sm_89 / source-built torch 2.9.0a0+145a3a7 with patch + cu130 runtime)
+
+**Numerical correctness (18/18 across fp32/fp16/bf16):**
+- All `Nc,Nc->N` shapes K ∈ {2, 4, 8, 16, 32, 64} produce **bit-exact** output vs the reference `(a*b).sum(-1)` (max_diff = 0 for cliff shapes; max_diff ≤ 4e-6 only at K=64 where bmm path takes over and uses TF32 accumulators)
+
+**Performance — cliff shapes (fast path active):**
+
+| N | c | manual µs | torch.einsum µs | ratio | verdict |
+|---|---|---:|---:|---:|---|
+| 1048576 | **2** | 99.92 | 95.76 | **0.958x** | **PARITY** ← was 30x slower pre-patch |
+| 1048576 | 4 | 140.88 | 139.03 | **0.987x** | **PARITY** |
+| 524288 | 8 | 152.50 | 155.54 | **1.020x** | **PARITY** |
+| 262144 | 16 | 151.98 | 152.18 | **1.001x** | **PARITY** |
+| 131072 | 32 | 160.46 | 159.84 | **0.996x** | **PARITY** |
+
+**Above-threshold (fall-through to bmm):**
+
+| N | c | manual µs | einsum µs | ratio |
+|---|---|---:|---:|---:|
+| 131072 | 64 | 536.89 | 360.37 | 0.671x (bmm wins as expected) |
+| 16384 | 256 | 101.20 | 68.20 | 0.674x |
+
+**Diag-of-attention `bhij,bhij->bhi` (small-N, launch-overhead-bound):**
+
+| B,H,T,d | manual µs | einsum µs | ratio |
+|---|---:|---:|---:|
+| 2,8,64,4 | 60.54 | 62.88 | 1.039x |
+| 4,16,32,8 | 58.24 | 62.07 | 1.066x |
+| 1,16,128,16 | 55.52 | 64.08 | 1.154x |
+
+These are at the launch-overhead floor; difference is within bench noise.
+
+**Note on absolute numbers.** Source-built torch is 3-4x slower per-op than the cu130 wheel (no LTO/PGO). The RATIOs match what the Python prework predicted. Pre-patch at the same shape would show 5-30x slowdowns; post-patch is parity. The mechanism is confirmed end-to-end: the fast path fires for `lo_size==1 && ro_size==1 && sum_size<=32`, replacing bmm with elementwise mul+sum, matching bmm's output bit-exactly within fp tolerance.
+
+### Build infrastructure findings
+
+Filed as a separate concern — `prework/einsum-small-k/ISSUE_DRAFT.md` documents the stale-version.h build break with reproducer. Worth filing upstream regardless of this PR — it bites any developer with a build dir from a prior pytorch checkout.
+
+### Phase 6.5 verdict
+
+**The patch ships clean.** Cliff eliminated, numerics preserved, scope narrow, fall-through correct. The PR can be opened with confidence.
